@@ -33,6 +33,17 @@ retries 503s, and caches results (30 s for prices, 1 h for daily history,
 24 h for the symbol list). If PSX changes its page layout, fixes go in
 `psx_mcp/parsers.py`.
 
+## Deploy on Vercel (free, no card)
+
+1. Push this folder to a private GitHub repo.
+2. vercel.com → **Add New… → Project** → import the repo. Leave build settings as detected.
+3. Add environment variable `MCP_SECRET` (32+ letters/digits), then **Deploy**.
+4. Check `https://<project>.vercel.app/health`.
+5. Connector URL: `https://<project>.vercel.app/<MCP_SECRET>/mcp`
+
+`vercel.json` pins the function to Mumbai (`bom1`), the region closest to PSX.
+`app.py` is the Vercel entrypoint; it serves MCP statelessly, one request at a time.
+
 ## Deploy on Render (free)
 
 1. Create a **private** GitHub repo (for example `psx-mcp`) and upload

@@ -51,13 +51,14 @@ def _free_port():
     s = socket.socket(); s.bind(("127.0.0.1", 0)); p = s.getsockname()[1]; s.close(); return p
 
 
-@pytest.fixture(scope="module")
-def base_url():
+@pytest.fixture(scope="module", params=["server", "serverless"])
+def base_url(request):
     import os
     os.environ["MCP_SECRET"] = SECRET
     S._client = PSXClient(transport=httpx.MockTransport(portal), min_interval=0)
     port = _free_port()
-    cfg = uvicorn.Config(S.build_app(), host="127.0.0.1", port=port, log_level="warning")
+    app = S.build_app() if request.param == "server" else S.build_serverless_app()
+    cfg = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning")
     srv = uvicorn.Server(cfg)
     t = threading.Thread(target=srv.run, daemon=True); t.start()
     for _ in range(100):
@@ -164,3 +165,17 @@ def test_token_refresh_on_403():
         await c.aclose()
         return rows
     assert len(run(go())) == 6
+
+
+def test_client_survives_new_event_loops():
+    """Serverless hosts may use a fresh loop per request; cached client must cope."""
+    c = PSXClient(transport=httpx.MockTransport(portal), min_interval=0)
+    assert len(asyncio.run(c.market_watch())) == 6
+    c.cache.clear()
+    assert len(asyncio.run(c.market_watch())) == 6
+    assert asyncio.run(c.company("MEBL"))["price"] == 547.94
+
+
+def test_serverless_requires_secret(monkeypatch):
+    monkeypatch.setenv("MCP_SECRET", "short")
+    assert S.build_serverless_app() is S._misconfigured

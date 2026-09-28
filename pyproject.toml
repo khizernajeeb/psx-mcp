@@ -1,0 +1,15 @@
+[project]
+name = "psx-mcp"
+version = "0.1.0"
+description = "PSX market data MCP connector for Claude"
+requires-python = ">=3.11"
+dependencies = [
+    "mcp==1.27.0",
+    "httpx==0.28.1",
+    "beautifulsoup4==4.14.3",
+    "lxml==6.1.0",
+    "uvicorn==0.46.0",
+]
+
+[tool.vercel]
+entrypoint = "app:app"

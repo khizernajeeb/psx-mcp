@@ -53,11 +53,14 @@ class _TTLCache:
     def __init__(self) -> None:
         self._data: dict[str, tuple[float, Any]] = {}
         self._locks: dict[str, asyncio.Lock] = {}
+        self._loop: asyncio.AbstractEventLoop | None = None
 
     async def get_or_set(self, key: str, ttl: float, fn: Callable[[], Awaitable[Any]]) -> Any:
         hit = self._data.get(key)
         if hit and hit[0] > time.monotonic():
             return hit[1]
+        if self._loop is not asyncio.get_running_loop():
+            self._loop, self._locks = asyncio.get_running_loop(), {}
         lock = self._locks.setdefault(key, asyncio.Lock())
         async with lock:  # one in-flight fetch per key
             hit = self._data.get(key)
@@ -83,6 +86,9 @@ class _TTLCache:
     def clear(self) -> None:
         self._data.clear()
 
+    def reset_locks(self) -> None:
+        self._locks = {}
+
 
 class PSXClient:
     def __init__(
@@ -91,27 +97,42 @@ class PSXClient:
         min_interval: float | None = None,
         max_retries: int = 3,
     ) -> None:
-        self._http = httpx.AsyncClient(
-            base_url=BASE_URL,
-            timeout=httpx.Timeout(20.0, connect=10.0),
-            headers={"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9", "Referer": BASE_URL + "/"},
-            transport=transport,
-            follow_redirects=True,
-        )
+        self._transport = transport
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._http: httpx.AsyncClient | None = None
         self._token: str | None = None
         self._token_at = 0.0
-        self._token_lock = asyncio.Lock()
-        self._sem = asyncio.Semaphore(2)
         self._min_interval = (
             float(os.environ.get("PSX_MIN_INTERVAL", "0.35")) if min_interval is None else min_interval
         )
         self._last_req = 0.0
-        self._pace_lock = asyncio.Lock()
         self._max_retries = max_retries
         self.cache = _TTLCache()
 
+    def _bind(self) -> None:
+        """(Re)create loop-bound objects when the running event loop changes.
+
+        Long-running servers keep one loop forever. Serverless hosts (Vercel)
+        may run each request on a fresh loop while keeping this module alive;
+        httpx clients and asyncio locks cannot cross loops, but cached data can."""
+        loop = asyncio.get_running_loop()
+        if loop is self._loop and self._http is not None:
+            return
+        self._loop = loop
+        self._http = httpx.AsyncClient(
+            base_url=BASE_URL,
+            timeout=httpx.Timeout(20.0, connect=10.0),
+            headers={"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9", "Referer": BASE_URL + "/"},
+            transport=self._transport,
+            follow_redirects=True,
+        )
+        self._token_lock = asyncio.Lock()
+        self._sem = asyncio.Semaphore(2)
+        self._pace_lock = asyncio.Lock()
+
     async def aclose(self) -> None:
-        await self._http.aclose()
+        if self._http is not None:
+            await self._http.aclose()
 
     # ------------------------------------------------------------------ low level
 
@@ -123,11 +144,13 @@ class PSXClient:
             self._last_req = time.monotonic()
 
     async def _raw(self, method: str, path: str, **kw: Any) -> httpx.Response:
+        self._bind()
         async with self._sem:
             await self._pace()
             return await self._http.request(method, path, **kw)
 
     async def _refresh_token(self, force: bool = False) -> str | None:
+        self._bind()
         async with self._token_lock:
             if self._token and not force and time.monotonic() - self._token_at < 3 * 3600:
                 return self._token

@@ -463,6 +463,54 @@ def build_app():
     return SecretPathMiddleware(inner, secret or None)
 
 
+class PerRequestMCP:
+    """Serverless-friendly MCP endpoint (Vercel and similar).
+
+    The normal app starts one session manager in the ASGI lifespan, which
+    serverless runtimes may never send. In stateless mode nothing needs to
+    live between requests, so each request gets its own short-lived manager."""
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "lifespan":
+            while True:
+                msg = await receive()
+                if msg["type"] == "lifespan.startup":
+                    await send({"type": "lifespan.startup.complete"})
+                elif msg["type"] == "lifespan.shutdown":
+                    await send({"type": "lifespan.shutdown.complete"})
+                    return
+        if scope["type"] != "http":
+            return
+        if scope["path"].rstrip("/") != "/mcp":
+            await send({"type": "http.response.start", "status": 404, "headers": [(b"content-type", b"text/plain")]})
+            await send({"type": "http.response.body", "body": b"Not found"})
+            return
+        from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+
+        mgr = StreamableHTTPSessionManager(
+            app=mcp._mcp_server,
+            json_response=True,
+            stateless=True,
+            security_settings=TransportSecuritySettings(enable_dns_rebinding_protection=False),
+        )
+        async with mgr.run():
+            await mgr.handle_request(scope, receive, send)
+
+
+async def _misconfigured(scope, receive, send):
+    if scope["type"] != "http":
+        return
+    await send({"type": "http.response.start", "status": 500, "headers": [(b"content-type", b"text/plain")]})
+    await send({"type": "http.response.body", "body": b"MCP_SECRET env var is missing or shorter than 16 characters"})
+
+
+def build_serverless_app():
+    secret = os.environ.get("MCP_SECRET", "").strip()
+    if len(secret) < 16:
+        return _misconfigured
+    return SecretPathMiddleware(PerRequestMCP(), secret)
+
+
 def main():
     import uvicorn
 
