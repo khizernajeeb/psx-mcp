@@ -12,3 +12,11 @@ services:
         value: 3.11.9
       - key: MCP_SECRET
         sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: CRON_SECRET
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false

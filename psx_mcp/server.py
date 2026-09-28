@@ -15,20 +15,43 @@ from datetime import datetime, time as dtime, timedelta, timezone
 from decimal import Decimal
 from typing import Annotated, Any, Literal
 
-import psycopg
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
 from pydantic import Field
 
-from . import analytics, db, repository
+from . import analytics
 from .client import PSXClient, PSXError
 from .parsers import PKT
 
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
 log = logging.getLogger("psx_mcp")
 
-DB_ERRORS = (PSXError, ValueError, RuntimeError, psycopg.Error)
+# The watchlist/alerts feature set needs psycopg + our own db/repository
+# modules; a missing or broken install of that (optional) dependency must
+# never take down the read-only PSX tools, which don't need a database at
+# all. Import it defensively and degrade the DB-backed tools individually.
+try:
+    import psycopg
+
+    from . import db, repository
+
+    DB_AVAILABLE = True
+    _DB_IMPORT_ERROR = ""
+except ImportError as _e:  # noqa: BLE001
+    psycopg = None  # type: ignore[assignment]
+    db = None  # type: ignore[assignment]
+    repository = None  # type: ignore[assignment]
+    DB_AVAILABLE = False
+    _DB_IMPORT_ERROR = str(_e)
+    log.warning("Watchlist/alerts tools unavailable: %s", _e)
+
+DB_ERRORS = (PSXError, ValueError, RuntimeError) + ((psycopg.Error,) if DB_AVAILABLE else ())
+
+
+def _require_db() -> None:
+    if not DB_AVAILABLE:
+        raise RuntimeError(f"Database features unavailable (psycopg failed to import: {_DB_IMPORT_ERROR})")
 
 INSTRUCTIONS = """\
 Live and historical data from the Pakistan Stock Exchange (PSX) Data Portal.
@@ -642,6 +665,7 @@ async def watchlist_add(
     """Add a PSX symbol to your watchlist, or update it if already there
     (upsert). Validates the symbol against the PSX symbol list."""
     try:
+        _require_db()
         row = await repository.watchlist_add(client(), symbol, target_buy, target_sell, reason, priority, notes, tags)
     except DB_ERRORS as e:
         return _err(e)
@@ -662,6 +686,7 @@ async def watchlist_update(
     """Update fields on an existing watchlist entry. Only the fields you pass
     are changed; everything else is left as-is."""
     try:
+        _require_db()
         row = await repository.watchlist_update(
             symbol, target_buy=target_buy, target_sell=target_sell, reason=reason,
             priority=priority, notes=notes, tags=tags, status=status,
@@ -675,6 +700,7 @@ async def watchlist_update(
 async def watchlist_remove(symbol: Annotated[str, Field(description="PSX ticker to remove")]) -> dict:
     """Remove a symbol from the watchlist."""
     try:
+        _require_db()
         removed = await repository.watchlist_remove(symbol)
     except DB_ERRORS as e:
         return _err(e)
@@ -689,6 +715,7 @@ async def watchlist_get(
 ) -> dict:
     """List your watchlist, optionally filtered by priority, status or tag."""
     try:
+        _require_db()
         rows = await repository.watchlist_get(priority, status, tag)
     except DB_ERRORS as e:
         return _err(e)
@@ -708,6 +735,7 @@ async def insider_activity(
     over psx_announcements, not a separate PSX feed. Defaults to your
     watchlist when symbols is omitted (there's no persisted portfolio yet)."""
     try:
+        _require_db()
         out = await repository.keyword_activity(client(), symbols, days, repository.INSIDER_KEYWORDS)
     except DB_ERRORS as e:
         return _err(e)
@@ -724,6 +752,7 @@ async def corporate_actions(
     search over psx_announcements. Defaults to your watchlist when symbols is
     omitted (there's no persisted portfolio yet)."""
     try:
+        _require_db()
         out = await repository.keyword_activity(client(), symbols, days, repository.CORPORATE_KEYWORDS)
     except DB_ERRORS as e:
         return _err(e)
@@ -747,6 +776,7 @@ async def alert_set(
     every ~15 minutes during market hours and delivered to Telegram; events also
     land in get_alerts."""
     try:
+        _require_db()
         row = await repository.alert_set(client(), symbol, type, threshold)
     except DB_ERRORS as e:
         return _err(e)
@@ -761,6 +791,7 @@ async def alert_list(
     """List configured alerts (not the events they've fired -- see get_alerts
     for that)."""
     try:
+        _require_db()
         rows = await repository.alert_list(symbol, status)
     except DB_ERRORS as e:
         return _err(e)
@@ -776,6 +807,7 @@ async def get_alerts(
     alert_list which just shows what's configured."""
     since_dt = datetime.fromisoformat(since) if since else datetime.now(timezone.utc) - timedelta(hours=24)
     try:
+        _require_db()
         rows = await repository.alert_events_since(since_dt)
     except DB_ERRORS as e:
         return _err(e)
@@ -939,10 +971,13 @@ async def psx_selftest() -> dict:
             "last_error": row.get("last_error"),
         }
 
-    await run("db_connectivity", db.fetchrow("SELECT 1 AS ok"), lambda v: v)
-    for table in ("watchlist", "alerts", "alert_events", "last_seen_announcement"):
-        await run(f"table:{table}", db.fetch(f"SELECT count(*) AS n FROM {table}"), lambda v: f"{v[0]['n']} rows")
-    await run("cron", _cron_status(), lambda v: v)
+    if DB_AVAILABLE:
+        await run("db_connectivity", db.fetchrow("SELECT 1 AS ok"), lambda v: v)
+        for table in ("watchlist", "alerts", "alert_events", "last_seen_announcement"):
+            await run(f"table:{table}", db.fetch(f"SELECT count(*) AS n FROM {table}"), lambda v: f"{v[0]['n']} rows")
+        await run("cron", _cron_status(), lambda v: v)
+    else:
+        checks["db_connectivity"] = {"ok": False, "error": f"psycopg failed to import: {_DB_IMPORT_ERROR}"}
 
     if not checks["token"]["ok"]:
         try:
@@ -984,6 +1019,8 @@ async def _handle_cron(scope, receive, send) -> None:
     expected = os.environ.get("CRON_SECRET", "").strip()
     if not expected or not hmac.compare_digest(got, expected):
         return await _json_response(send, 401, {"error": "unauthorized"})
+    if not DB_AVAILABLE:
+        return await _json_response(send, 503, {"error": f"Database unavailable: {_DB_IMPORT_ERROR}"})
     try:
         summary = await repository.evaluate_alerts(client())
     except Exception as e:  # noqa: BLE001
