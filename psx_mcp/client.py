@@ -30,6 +30,20 @@ UA = (
     "(KHTML, like Gecko) Chrome/128.0 Safari/537.36"
 )
 
+# Full header set a desktop Chrome sends; some WAFs score requests on these.
+BROWSER_HEADERS = {
+    "User-Agent": UA,
+    "Accept-Language": "en-US,en;q=0.9,ur;q=0.8",
+    "Accept-Encoding": "gzip, deflate",
+    "Referer": BASE_URL + "/",
+    "sec-ch-ua": '"Chromium";v="128", "Not;A=Brand";v="24", "Google Chrome";v="128"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
+    "Sec-Fetch-Site": "same-origin",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Dest": "empty",
+}
+
 # Cache lifetimes (seconds). Prices move, reference data doesn't.
 TTL = {
     "market_watch": 30,
@@ -122,9 +136,10 @@ class PSXClient:
         self._http = httpx.AsyncClient(
             base_url=BASE_URL,
             timeout=httpx.Timeout(20.0, connect=10.0),
-            headers={"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9", "Referer": BASE_URL + "/"},
+            headers=BROWSER_HEADERS,
             transport=self._transport,
             follow_redirects=True,
+            http2=self._transport is None,
         )
         self._token_lock = asyncio.Lock()
         self._sem = asyncio.Semaphore(2)
@@ -154,7 +169,17 @@ class PSXClient:
         async with self._token_lock:
             if self._token and not force and time.monotonic() - self._token_at < 3 * 3600:
                 return self._token
-            r = await self._raw("GET", "/", headers={"Accept": "text/html"})
+            r = await self._raw(
+                "GET",
+                "/",
+                headers={
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Sec-Fetch-Mode": "navigate",
+                    "Sec-Fetch-Dest": "document",
+                    "Sec-Fetch-Site": "none",
+                    "Upgrade-Insecure-Requests": "1",
+                },
+            )
             if r.status_code != 200:
                 raise PSXError(f"PSX homepage returned HTTP {r.status_code} while fetching access token")
             tok = parsers.extract_token(r.text)
@@ -162,6 +187,17 @@ class PSXClient:
                 log.warning("No X-Req-Id token found on PSX homepage; continuing without it")
             self._token, self._token_at = tok, time.monotonic()
             return tok
+
+    async def probe(self) -> dict:
+        """Diagnostics for blocked responses: status, server headers, body start."""
+        r = await self._raw("GET", "/", headers={"Accept": "text/html"})
+        keep = ("server", "via", "x-cdn", "x-iinfo", "x-sucuri-id", "cf-ray", "x-amz-cf-id", "x-request-id", "set-cookie")
+        return {
+            "status": r.status_code,
+            "http_version": r.http_version,
+            "headers": {k: v[:120] for k, v in r.headers.items() if k.lower() in keep},
+            "body_start": r.text[:300],
+        }
 
     async def page(self, path: str) -> str:
         """Plain HTML page."""
@@ -175,7 +211,12 @@ class PSXClient:
         for attempt in range(self._max_retries + 1):
             headers = {"Accept": "text/html, application/json, */*; q=0.01"}
             if ajax:
-                tok = await self._refresh_token()
+                try:
+                    tok = await self._refresh_token()
+                except httpx.HTTPError as e:
+                    last = f"network error: {e!r}"
+                    await asyncio.sleep(0.8 * (attempt + 1))
+                    continue
                 headers["X-Requested-With"] = "XMLHttpRequest"
                 if tok:
                     headers["X-Req-Id"] = tok

@@ -416,8 +416,14 @@ async def psx_selftest() -> dict:
     await run("payouts", c.payouts("MEBL"), lambda v: f"{len(v)} payouts")
     await run("announcements", c.announcements("MEBL", count=3), lambda v: f"{len(v['items'])} items of {v['total']}")
     await run("constituents", c.constituents("KSE100"), lambda v: f"{len(v)} members")
-    ok = sum(1 for v in checks.values() if v["ok"])
-    return {"fetched_at": _now(), "passed": f"{ok}/{len(checks)}", "checks": checks}
+    if not checks["token"]["ok"]:
+        try:
+            checks["diagnostics"] = {"ok": True, "sample": await c.probe()}
+        except Exception as e:  # noqa: BLE001
+            checks["diagnostics"] = {"ok": False, "error": repr(e)[:300]}
+    ok = sum(1 for k, v in checks.items() if v["ok"] and k != "diagnostics")
+    total = len([k for k in checks if k != "diagnostics"])
+    return {"fetched_at": _now(), "passed": f"{ok}/{total}", "checks": checks}
 
 
 # =============================================================================== ASGI app
