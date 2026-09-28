@@ -7,6 +7,10 @@ indicators, dividends, announcements, index members and sectors.
 Data comes from the public PSX Data Portal (dps.psx.com.pk). This is for
 **personal use**. Redistributing PSX market data needs a PSX licence.
 
+See [PRIVACY.md](PRIVACY.md) for what data this server processes, and
+[LICENSE](LICENSE) for the code's licence (MIT; separate from PSX's own
+licensing terms on the underlying data).
+
 ## Tools
 
 | Tool | What it answers |
@@ -41,7 +45,8 @@ retries 503s, and caches results (30 s for prices, 1 h for daily history,
 
 ## Deploy on Vercel (free, no card)
 
-1. Push this folder to a private GitHub repo.
+1. Push this folder to a GitHub repo (public or private both work; nothing
+   secret is committed — `MCP_SECRET` is set as an env var, never in code).
 2. vercel.com → **Add New… → Project** → import the repo. Leave build settings as detected.
 3. Add environment variable `MCP_SECRET` (32+ letters/digits), then **Deploy**.
 4. Check `https://<project>.vercel.app/health`.
@@ -52,8 +57,8 @@ retries 503s, and caches results (30 s for prices, 1 h for daily history,
 
 ## Deploy on Render (free)
 
-1. Create a **private** GitHub repo (for example `psx-mcp`) and upload
-   everything in this folder.
+1. Create a GitHub repo (for example `psx-mcp`, public or private) and
+   upload everything in this folder.
 2. On render.com, choose **New → Blueprint**, pick the repo, and Render reads
    `render.yaml` (Singapore region, free plan).
 3. When it asks for `MCP_SECRET`, paste a long random string (32+ letters and
@@ -73,6 +78,11 @@ Treat the connector URL like a password, since anyone with it can use your serve
 
 ## Things to know
 
+* **Single-tenant by design:** this is built for one person's own deployment
+  with one shared secret, not a multi-tenant public service. All requests
+  from a deployment leave from the same IP and share one in-memory cache; if
+  many people used the same instance, PSX could rate-limit or block that IP
+  for everyone. Don't share a deployed connector URL widely.
 * **Cold starts:** Render's free plan sleeps after about 15 minutes idle. The
   first call after that can take 30 to 60 seconds, and Claude may time out
   once. Retry, or upgrade to the Starter plan to keep it awake.

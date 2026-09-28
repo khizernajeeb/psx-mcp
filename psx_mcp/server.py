@@ -56,7 +56,8 @@ def _now() -> str:
     return datetime.now(PKT).strftime("%Y-%m-%d %H:%M PKT")
 
 
-RO = ToolAnnotations(readOnlyHint=True, openWorldHint=True, idempotentHint=True)
+def ro(title: str) -> ToolAnnotations:
+    return ToolAnnotations(title=title, readOnlyHint=True, destructiveHint=False, openWorldHint=True, idempotentHint=True)
 
 mcp = FastMCP(
     "PSX",
@@ -98,7 +99,7 @@ def _slim(r: dict) -> dict:
 # =============================================================================== tools
 
 
-@mcp.tool(annotations=RO)
+@mcp.tool(annotations=ro("Market Summary"))
 async def psx_market_summary() -> dict:
     """Snapshot of the whole PSX market right now: all index levels (KSE100, KSE30,
     KMI30, KMIALLSHR, ALLSHR, ...), market breadth (advancers/decliners/unchanged),
@@ -131,7 +132,7 @@ async def psx_market_summary() -> dict:
     }
 
 
-@mcp.tool(annotations=RO)
+@mcp.tool(annotations=ro("Stock Quote"))
 async def psx_quote(
     symbols: Annotated[list[str], Field(description="One or more PSX tickers, e.g. ['MEBL','LUCK']", min_length=1, max_length=60)],
 ) -> dict:
@@ -172,7 +173,7 @@ async def psx_quote(
     return out
 
 
-@mcp.tool(annotations=RO)
+@mcp.tool(annotations=ro("Top Movers"))
 async def psx_top_movers(
     category: Annotated[Literal["gainers", "losers", "active", "value"], Field(description="gainers/losers by % change, active by volume, value by traded value (price x volume)")] = "gainers",
     limit: Annotated[int, Field(ge=1, le=100)] = 10,
@@ -209,7 +210,7 @@ async def psx_top_movers(
     return {"fetched_at": _now(), "category": category, "count": len(out), "results": out}
 
 
-@mcp.tool(annotations=RO)
+@mcp.tool(annotations=ro("Company Profile"))
 async def psx_company(
     symbol: Annotated[str, Field(description="PSX ticker, e.g. MEBL")],
     sections: Annotated[
@@ -248,7 +249,7 @@ async def psx_company(
 _PERIOD_DAYS = {"1m": 31, "3m": 92, "6m": 183, "1y": 366, "3y": 1096, "5y": 1827, "max": 100000}
 
 
-@mcp.tool(annotations=RO)
+@mcp.tool(annotations=ro("Price History"))
 async def psx_price_history(
     symbol: Annotated[str, Field(description="PSX ticker, or an index code such as KSE100, KMI30, ALLSHR")],
     period: Annotated[Literal["1m", "3m", "6m", "1y", "3y", "5y", "max"], Field(description="Window of bars to return")] = "3m",
@@ -306,7 +307,7 @@ async def psx_price_history(
     return out
 
 
-@mcp.tool(annotations=RO)
+@mcp.tool(annotations=ro("Dividend History"))
 async def psx_dividends(symbol: Annotated[str, Field(description="PSX ticker")]) -> dict:
     """Dividend / bonus / right-share payout history with book-closure dates.
     PSX quotes payouts as % of face value (usually PKR 10), so 75% = PKR 7.50
@@ -326,7 +327,7 @@ async def psx_dividends(symbol: Annotated[str, Field(description="PSX ticker")])
 _ANN_TYPES = {"companies": "C", "psx": "E", "secp": "B", "cdc": "A", "nccpl": "D"}
 
 
-@mcp.tool(annotations=RO)
+@mcp.tool(annotations=ro("Corporate Announcements"))
 async def psx_announcements(
     symbol: Annotated[str | None, Field(description="PSX ticker; omit for all companies")] = None,
     keyword: Annotated[str, Field(description="Search in titles, e.g. 'financial results', 'dividend', 'board meeting'")] = "",
@@ -348,7 +349,7 @@ async def psx_announcements(
     return {"fetched_at": _now(), **res}
 
 
-@mcp.tool(annotations=RO)
+@mcp.tool(annotations=ro("Index Constituents"))
 async def psx_index_constituents(
     index: Annotated[str, Field(description="Index code such as KSE100, KSE30, KMI30, KMIALLSHR, ALLSHR (psx_market_summary lists every index code)")] = "KSE100",
     sort_by: Annotated[Literal["weight", "points", "change_pct", "market_cap", "volume"], Field()] = "weight",
@@ -366,7 +367,7 @@ async def psx_index_constituents(
     return {"index": index.upper(), "fetched_at": _now(), "count": len(rows), "constituents": rows[:limit]}
 
 
-@mcp.tool(annotations=RO)
+@mcp.tool(annotations=ro("Sector Overview"))
 async def psx_sectors() -> dict:
     """Sector-level view: advancers/decliners/unchanged, turnover and market cap
     (PKR billions) for every PSX sector, sorted by market cap."""
@@ -378,7 +379,7 @@ async def psx_sectors() -> dict:
     return {"fetched_at": _now(), "sectors": rows}
 
 
-@mcp.tool(annotations=RO)
+@mcp.tool(annotations=ro("Ticker Search"))
 async def psx_search(
     query: Annotated[str, Field(description="Company name or partial ticker, e.g. 'meezan', 'lucky', 'engro'")],
     include_debt: bool = False,
@@ -416,7 +417,7 @@ async def _screener_with_sectors() -> list[dict]:
     return [{**r, "sector": names.get(r["sector_code"], r["sector_code"])} for r in rows]
 
 
-@mcp.tool(annotations=RO)
+@mcp.tool(annotations=ro("Stock Screener"))
 async def psx_screener(
     sector: Annotated[str | None, Field(description="Sector name, partial match: 'cement', 'bank', 'fertilizer', 'oil & gas exploration', 'technology'")] = None,
     index: Annotated[str | None, Field(description="Only members of this index, e.g. KSE100, KSE30, KMI30, KMIALLSHR")] = None,
@@ -485,7 +486,7 @@ async def psx_screener(
     return {"fetched_at": _now(), "matches": len(hits), "returned": len(out), "results": out}
 
 
-@mcp.tool(annotations=RO)
+@mcp.tool(annotations=ro("Compare Stocks"))
 async def psx_compare(
     symbols: Annotated[list[str], Field(description="2-10 tickers to compare side by side", min_length=2, max_length=10)],
     include_technicals: Annotated[bool, Field(description="Add RSI, SMA200 position and 1m/3m returns (slower)")] = True,
@@ -525,7 +526,7 @@ async def psx_compare(
     return out
 
 
-@mcp.tool(annotations=RO)
+@mcp.tool(annotations=ro("Portfolio Valuation"))
 async def psx_portfolio(
     holdings: Annotated[
         list[dict],
@@ -600,7 +601,7 @@ async def psx_portfolio(
     return out
 
 
-@mcp.tool(annotations=RO)
+@mcp.tool(annotations=ro("Recent Payouts"))
 async def psx_recent_payouts(
     symbol: Annotated[str | None, Field(description="Filter by ticker; omit for the whole market")] = None,
     only_cash: Annotated[bool, Field(description="Only cash dividends")] = False,
@@ -621,7 +622,7 @@ async def psx_recent_payouts(
             "note": "Payout % is on face value (usually PKR 10): 100% = PKR 10/share."}
 
 
-@mcp.tool(annotations=RO)
+@mcp.tool(annotations=ro("Corporate Calendar"))
 async def psx_corporate_calendar(
     date_from: Annotated[str | None, Field(description="YYYY-MM-DD; default today")] = None,
     date_to: Annotated[str | None, Field(description="YYYY-MM-DD; default 30 days after date_from")] = None,
@@ -650,7 +651,7 @@ async def psx_corporate_calendar(
     return {"fetched_at": _now(), "from": start.isoformat(), "to": end.isoformat(), "count": len(events), "events": events}
 
 
-@mcp.tool(annotations=RO)
+@mcp.tool(annotations=ro("Financial Reports"))
 async def psx_financial_reports(
     symbol: Annotated[str, Field(description="PSX ticker")],
     report_type: Annotated[Literal["all", "annual", "quarterly"], Field()] = "all",
@@ -667,7 +668,7 @@ async def psx_financial_reports(
     return {"symbol": symbol.upper(), "fetched_at": _now(), "count": len(rows), "reports": rows[:limit]}
 
 
-@mcp.tool(annotations=RO)
+@mcp.tool(annotations=ro("Server Self-Test"))
 async def psx_selftest() -> dict:
     """Health check: calls every PSX endpoint this server depends on and reports
     which ones parse correctly. Use when other tools return errors."""
