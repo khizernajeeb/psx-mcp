@@ -1,0 +1,22 @@
+name: Check PSX alerts
+
+# Vercel Hobby cron only runs once a day, too coarse for intraday alerts, so
+# this workflow calls our own protected endpoint every 15 minutes instead.
+# 04:00-11:59 UTC covers PSX market hours (09:00-16:59 PKT, UTC+5) with a
+# safety margin; the endpoint itself re-checks the exact time before doing
+# any work.
+on:
+  schedule:
+    - cron: "*/15 4-11 * * 1-5"
+  workflow_dispatch: {}
+
+jobs:
+  check-alerts:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call check-alerts endpoint
+        run: |
+          curl -sS -X POST "${{ secrets.APP_URL }}/api/cron/check-alerts" \
+            -H "X-Cron-Secret: ${{ secrets.CRON_SECRET }}" \
+            -w "\nHTTP %{http_code}\n" \
+            --fail-with-body

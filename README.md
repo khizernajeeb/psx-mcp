@@ -31,7 +31,25 @@ licensing terms on the underlying data).
 | `psx_recent_payouts` | Market‑wide latest dividend/bonus/right announcements and book closures |
 | `psx_corporate_calendar` | Upcoming AGMs, EOGMs and annual review meetings |
 | `psx_financial_reports` | Annual and quarterly report PDF links |
-| `psx_selftest` | Checks every PSX endpoint; run it first after deploying |
+| `psx_selftest` | Checks every PSX endpoint plus the database and alert cron; run it first after deploying |
+
+### Watchlist, alerts and insider/corporate activity (needs a database)
+
+These persist to Postgres instead of just reading PSX; see **Watchlist and
+alerts setup** below before using them.
+
+| Tool | What it does |
+|---|---|
+| `watchlist_add` / `watchlist_update` / `watchlist_remove` / `watchlist_get` | Manage a watchlist: target buy/sell prices, priority, tags, notes |
+| `insider_activity` | Keyword-searches announcements for director/sponsor share transactions and buy-backs, for your watchlist (or given symbols) |
+| `corporate_actions` | Keyword-searches announcements for right shares, mergers, material information and board meetings |
+| `alert_set` / `alert_list` / `get_alerts` | Configure price/volume/announcement alerts, checked every ~15 min during market hours and delivered to Telegram |
+| `why_moved` | A day's price change plus that window's announcements, for a quick "why did it move" answer |
+
+Note: `insider_activity`/`corporate_actions` default to your **watchlist**
+when no symbols are given. There's no persisted portfolio yet (`psx_portfolio`
+takes holdings as a call-time argument and stores nothing), so they can't
+default to "portfolio + watchlist" until that exists.
 
 ## How it talks to PSX
 
@@ -49,6 +67,8 @@ retries 503s, and caches results (30 s for prices, 1 h for daily history,
    secret is committed — `MCP_SECRET` is set as an env var, never in code).
 2. vercel.com → **Add New… → Project** → import the repo. Leave build settings as detected.
 3. Add environment variable `MCP_SECRET` (32+ letters/digits), then **Deploy**.
+   For the watchlist/alerts tools, also add `DATABASE_URL`, `CRON_SECRET` and
+   the `TELEGRAM_*` vars -- see **Watchlist and alerts setup** below.
 4. Check `https://<project>.vercel.app/health`.
 5. Connector URL: `https://<project>.vercel.app/<MCP_SECRET>/mcp`
 
@@ -62,17 +82,55 @@ retries 503s, and caches results (30 s for prices, 1 h for daily history,
 2. On render.com, choose **New → Blueprint**, pick the repo, and Render reads
    `render.yaml` (Singapore region, free plan).
 3. When it asks for `MCP_SECRET`, paste a long random string (32+ letters and
-   digits, no `/`).
+   digits, no `/`). For the watchlist/alerts tools, also set `DATABASE_URL`,
+   `CRON_SECRET` and the `TELEGRAM_*` vars -- see **Watchlist and alerts
+   setup** below.
 4. After the deploy goes green, open `https://<your-app>.onrender.com/health`.
    It should show `{"status":"ok"}`.
 5. Your connector URL is:
    `https://<your-app>.onrender.com/<MCP_SECRET>/mcp`
 
+## Watchlist and alerts setup
+
+The watchlist/alerts/insider/corporate-actions tools need a Postgres database
+and, for Telegram delivery, a bot. Skip this section if you only want the
+read-only PSX tools above — everything else works without it (and
+`psx_selftest` will just report those checks as failing, not crash).
+
+1. **Database.** On Vercel, add **Neon Postgres** from the Vercel Marketplace
+   and copy its **pooled** connection string (the one through Neon's
+   connection pooler, not the direct one) into `DATABASE_URL`. Any Postgres
+   works if you're not on Vercel.
+2. **Apply migrations** (once, after setting `DATABASE_URL`, and again after
+   pulling any new file under `migrations/`):
+   ```bash
+   DATABASE_URL=postgresql://... python -m psx_mcp.db
+   ```
+3. **Telegram bot** (optional, for alert delivery). Message
+   [@BotFather](https://t.me/BotFather) to create a bot and get
+   `TELEGRAM_BOT_TOKEN`. Send your bot any message, then open
+   `https://api.telegram.org/bot<token>/getUpdates` to find your numeric
+   `TELEGRAM_CHAT_ID`. Without these set, alerts still evaluate and land in
+   `get_alerts`, they just aren't pushed to Telegram.
+4. **Alert cron.** Vercel Hobby's cron only fires once a day, too coarse for
+   intraday alerts, so alerts are checked by `POST /api/cron/check-alerts`
+   (header `X-Cron-Secret: $CRON_SECRET`), called every 15 minutes by
+   [`.github/workflows/check-alerts.yml`](.github/workflows/check-alerts.yml).
+   Set repo secrets `APP_URL` (your deployed base URL, no trailing slash) and
+   `CRON_SECRET` (same value as the server's env var) under
+   **Settings → Secrets and variables → Actions**, and make sure the workflow
+   is enabled (GitHub disables scheduled workflows on forks/inactive repos —
+   trigger it once manually via **Actions → Check PSX alerts → Run workflow**
+   if it doesn't seem to be firing). This endpoint works the same way on
+   Render too, so a `curl`-based cron (e.g. cron-job.org) works there instead
+   of GitHub Actions if you prefer.
+
 ## Connect to Claude
 
 Go to claude.ai → **Settings → Connectors → Add custom connector**. Name it
 `PSX`, paste the connector URL, and leave OAuth empty. In a chat, enable the
-connector and ask Claude to run `psx_selftest`. All 16 checks should pass.
+connector and ask Claude to run `psx_selftest`. All 16 PSX checks (plus the
+database/cron ones, if configured) should pass.
 
 Treat the connector URL like a password, since anyone with it can use your server.
 
@@ -99,4 +157,13 @@ pip install -r requirements-dev.txt
 pytest -q tests                      # uses saved fixtures, no network
 MCP_SECRET=local-dev-secret-123456 python -m psx_mcp.server
 # connector URL: http://localhost:8000/local-dev-secret-123456/mcp
+```
+
+`tests/test_extensions.py` (watchlist/alerts/insider/corporate/why_moved)
+needs a real, disposable Postgres -- it's skipped automatically if
+`TEST_DATABASE_URL` isn't set:
+
+```bash
+docker run --rm -d -p 5432:5432 -e POSTGRES_PASSWORD=postgres postgres:16
+TEST_DATABASE_URL=postgresql://postgres:postgres@localhost:5432/postgres pytest -q tests
 ```

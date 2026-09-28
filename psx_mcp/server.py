@@ -6,23 +6,29 @@ Connector URL: https://<host>/<MCP_SECRET>/mcp
 
 from __future__ import annotations
 
+import hmac
+import json
 import logging
 import os
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta
+from datetime import datetime, time as dtime, timedelta, timezone
+from decimal import Decimal
 from typing import Annotated, Any, Literal
 
+import psycopg
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
 from pydantic import Field
 
-from . import analytics
+from . import analytics, db, repository
 from .client import PSXClient, PSXError
 from .parsers import PKT
 
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
 log = logging.getLogger("psx_mcp")
+
+DB_ERRORS = (PSXError, ValueError, RuntimeError, psycopg.Error)
 
 INSTRUCTIONS = """\
 Live and historical data from the Pakistan Stock Exchange (PSX) Data Portal.
@@ -40,7 +46,13 @@ AGMs/EOGMs, psx_financial_reports for report PDFs. psx_price_history also
 accepts index codes (KSE100, KMI30). Symbols are PSX tickers
 like MEBL, LUCK, OGDC; use psx_search when you only know the company name.
 Data is scraped from the public portal and may lag slightly; it is not
-investment advice."""
+investment advice.
+
+Persisted (own database, not PSX): watchlist_add/update/remove/get manage a
+watchlist; insider_activity and corporate_actions keyword-search announcements
+for the watchlist (or explicit symbols); alert_set/alert_list/get_alerts
+manage price/volume/announcement alerts checked every ~15 min during market
+hours and delivered to Telegram; why_moved explains a specific day's move."""
 
 _client: PSXClient | None = None
 
@@ -58,6 +70,19 @@ def _now() -> str:
 
 def ro(title: str) -> ToolAnnotations:
     return ToolAnnotations(title=title, readOnlyHint=True, destructiveHint=False, openWorldHint=True, idempotentHint=True)
+
+
+def mut(title: str, *, destructive: bool = False) -> ToolAnnotations:
+    """Annotations for a tool that writes to our own database (not PSX)."""
+    return ToolAnnotations(title=title, readOnlyHint=False, destructiveHint=destructive, openWorldHint=False, idempotentHint=True)
+
+
+def _jsonify(row: dict | None) -> dict | None:
+    """Postgres numeric columns come back as Decimal; make them plain JSON numbers."""
+    if row is None:
+        return None
+    return {k: (float(v) if isinstance(v, Decimal) else v) for k, v in row.items()}
+
 
 mcp = FastMCP(
     "PSX",
@@ -601,6 +626,204 @@ async def psx_portfolio(
     return out
 
 
+# =============================================================================== watchlist
+
+
+@mcp.tool(annotations=mut("Add to Watchlist"))
+async def watchlist_add(
+    symbol: Annotated[str, Field(description="PSX ticker, e.g. MEBL")],
+    target_buy: Annotated[float | None, Field(description="Price you'd consider buying at (PKR)")] = None,
+    target_sell: Annotated[float | None, Field(description="Price you'd consider selling at (PKR)")] = None,
+    reason: Annotated[str | None, Field(description="Why this is on your watchlist")] = None,
+    priority: Annotated[Literal["low", "medium", "high"], Field()] = "medium",
+    notes: Annotated[str | None, Field()] = None,
+    tags: Annotated[list[str] | None, Field(description="Free-form labels, e.g. ['dividend', 'cement']")] = None,
+) -> dict:
+    """Add a PSX symbol to your watchlist, or update it if already there
+    (upsert). Validates the symbol against the PSX symbol list."""
+    try:
+        row = await repository.watchlist_add(client(), symbol, target_buy, target_sell, reason, priority, notes, tags)
+    except DB_ERRORS as e:
+        return _err(e)
+    return {**_jsonify(row), "as_of": _now()}
+
+
+@mcp.tool(annotations=mut("Update Watchlist Entry"))
+async def watchlist_update(
+    symbol: Annotated[str, Field(description="PSX ticker already on the watchlist")],
+    target_buy: Annotated[float | None, Field()] = None,
+    target_sell: Annotated[float | None, Field()] = None,
+    reason: Annotated[str | None, Field()] = None,
+    priority: Annotated[Literal["low", "medium", "high"] | None, Field()] = None,
+    notes: Annotated[str | None, Field()] = None,
+    tags: Annotated[list[str] | None, Field()] = None,
+    status: Annotated[Literal["watching", "paused", "hit", "archived"] | None, Field()] = None,
+) -> dict:
+    """Update fields on an existing watchlist entry. Only the fields you pass
+    are changed; everything else is left as-is."""
+    try:
+        row = await repository.watchlist_update(
+            symbol, target_buy=target_buy, target_sell=target_sell, reason=reason,
+            priority=priority, notes=notes, tags=tags, status=status,
+        )
+    except DB_ERRORS as e:
+        return _err(e)
+    return {**_jsonify(row), "as_of": _now()}
+
+
+@mcp.tool(annotations=mut("Remove from Watchlist", destructive=True))
+async def watchlist_remove(symbol: Annotated[str, Field(description="PSX ticker to remove")]) -> dict:
+    """Remove a symbol from the watchlist."""
+    try:
+        removed = await repository.watchlist_remove(symbol)
+    except DB_ERRORS as e:
+        return _err(e)
+    return {"symbol": symbol.upper().strip(), "removed": removed, "as_of": _now()}
+
+
+@mcp.tool(annotations=ro("Get Watchlist"))
+async def watchlist_get(
+    priority: Annotated[Literal["low", "medium", "high"] | None, Field()] = None,
+    status: Annotated[Literal["watching", "paused", "hit", "archived"] | None, Field()] = None,
+    tag: Annotated[str | None, Field(description="Only entries with this exact tag")] = None,
+) -> dict:
+    """List your watchlist, optionally filtered by priority, status or tag."""
+    try:
+        rows = await repository.watchlist_get(priority, status, tag)
+    except DB_ERRORS as e:
+        return _err(e)
+    return {"as_of": _now(), "count": len(rows), "watchlist": [_jsonify(r) for r in rows]}
+
+
+# =============================================================================== insider / corporate activity
+
+
+@mcp.tool(annotations=ro("Insider Activity"))
+async def insider_activity(
+    symbols: Annotated[list[str] | None, Field(description="Tickers to check; omit to use your watchlist")] = None,
+    days: Annotated[int, Field(ge=1, le=365, description="How many days back to search")] = 30,
+) -> dict:
+    """Announcements that look like insider / sponsor activity: transactions
+    in shares by directors or sponsors, and buy-backs. Built by keyword search
+    over psx_announcements, not a separate PSX feed. Defaults to your
+    watchlist when symbols is omitted (there's no persisted portfolio yet)."""
+    try:
+        out = await repository.keyword_activity(client(), symbols, days, repository.INSIDER_KEYWORDS)
+    except DB_ERRORS as e:
+        return _err(e)
+    return {"as_of": _now(), **out}
+
+
+@mcp.tool(annotations=ro("Corporate Actions"))
+async def corporate_actions(
+    symbols: Annotated[list[str] | None, Field(description="Tickers to check; omit to use your watchlist")] = None,
+    days: Annotated[int, Field(ge=1, le=365, description="How many days back to search")] = 30,
+) -> dict:
+    """Announcements that look like corporate actions: right shares, material
+    information, mergers/amalgamations and board meetings. Built by keyword
+    search over psx_announcements. Defaults to your watchlist when symbols is
+    omitted (there's no persisted portfolio yet)."""
+    try:
+        out = await repository.keyword_activity(client(), symbols, days, repository.CORPORATE_KEYWORDS)
+    except DB_ERRORS as e:
+        return _err(e)
+    return {"as_of": _now(), **out}
+
+
+# =============================================================================== alerts
+
+
+@mcp.tool(annotations=mut("Set Alert"))
+async def alert_set(
+    symbol: Annotated[str, Field(description="PSX ticker")],
+    type: Annotated[Literal["price_above", "price_below", "volume_spike", "new_announcement"], Field()],
+    threshold: Annotated[
+        float | None,
+        Field(description="Price (PKR) for price_above/price_below, or a multiple of 30-day average volume for volume_spike, e.g. 3 for 3x. Not used for new_announcement."),
+    ] = None,
+) -> dict:
+    """Create or update an alert for a symbol (one alert per symbol+type; setting
+    it again replaces the threshold and re-activates it). Alerts are evaluated
+    every ~15 minutes during market hours and delivered to Telegram; events also
+    land in get_alerts."""
+    try:
+        row = await repository.alert_set(client(), symbol, type, threshold)
+    except DB_ERRORS as e:
+        return _err(e)
+    return {**_jsonify(row), "as_of": _now()}
+
+
+@mcp.tool(annotations=ro("List Alerts"))
+async def alert_list(
+    symbol: Annotated[str | None, Field()] = None,
+    status: Annotated[Literal["active", "triggered", "disabled"] | None, Field()] = None,
+) -> dict:
+    """List configured alerts (not the events they've fired -- see get_alerts
+    for that)."""
+    try:
+        rows = await repository.alert_list(symbol, status)
+    except DB_ERRORS as e:
+        return _err(e)
+    return {"as_of": _now(), "count": len(rows), "alerts": [_jsonify(r) for r in rows]}
+
+
+@mcp.tool(annotations=ro("Get Alert Events"))
+async def get_alerts(
+    since: Annotated[str | None, Field(description="ISO timestamp; defaults to the last 24 hours")] = None,
+) -> dict:
+    """Alert events that have fired since `since` (default: last 24h), newest
+    first. This is what a scheduled check has actually found, as opposed to
+    alert_list which just shows what's configured."""
+    since_dt = datetime.fromisoformat(since) if since else datetime.now(timezone.utc) - timedelta(hours=24)
+    try:
+        rows = await repository.alert_events_since(since_dt)
+    except DB_ERRORS as e:
+        return _err(e)
+    return {"as_of": _now(), "since": since_dt.isoformat(), "count": len(rows), "events": [_jsonify(r) for r in rows]}
+
+
+# =============================================================================== why did it move
+
+
+@mcp.tool(annotations=ro("Why It Moved"))
+async def why_moved(
+    symbol: Annotated[str, Field(description="PSX ticker")],
+    date: Annotated[str, Field(description="YYYY-MM-DD")],
+) -> dict:
+    """Explain a price move: that day's OHLCV plus change vs the prior close,
+    and any announcements from the day before through the day after (results
+    can come out before or after the session)."""
+    try:
+        bars = await client().eod(symbol)
+    except PSXError as e:
+        return _err(e)
+    idx = next((i for i, b in enumerate(bars) if b["date"] == date), None)
+    if idx is None:
+        return {"symbol": symbol.upper(), "date": date, "error": "No price bar for that date (holiday, not yet listed, or out of range)"}
+    bar = bars[idx]
+    prev = bars[idx - 1] if idx > 0 else None
+    change = (bar["close"] - prev["close"]) if prev else None
+    change_pct = round(change / prev["close"] * 100, 2) if prev and prev["close"] else None
+    day = datetime.fromisoformat(date).date()
+    try:
+        ann = await client().announcements(
+            symbol=symbol, count=20,
+            date_from=(day - timedelta(days=1)).isoformat(), date_to=(day + timedelta(days=1)).isoformat(),
+        )
+    except PSXError as e:
+        ann = {"items": [], "error": str(e)}
+    return {
+        "symbol": symbol.upper(),
+        "date": date,
+        "as_of": _now(),
+        "price": {
+            "open": bar["open"], "close": bar["close"], "volume": bar["volume"],
+            "prev_close": prev["close"] if prev else None, "change": change, "change_pct": change_pct,
+        },
+        "announcements": ann.get("items", []),
+    }
+
+
 @mcp.tool(annotations=ro("Recent Payouts"))
 async def psx_recent_payouts(
     symbol: Annotated[str | None, Field(description="Filter by ticker; omit for the whole market")] = None,
@@ -700,6 +923,27 @@ async def psx_selftest() -> dict:
     await run("calendar", c.calendar(_today.isoformat(), (_today + timedelta(days=30)).isoformat()), lambda v: f"{len(v)} events")
     await run("reports", c.reports("LUCK"), lambda v: f"{len(v)} reports, newest {v[0]['period_ended'] if v else None}")
     await run("index_history", c.eod("KSE100"), lambda v: f"{len(v)} bars, last {v[-1]['close'] if v else None}")
+
+    async def _cron_status():
+        row = await db.fetchrow("SELECT * FROM cron_state WHERE id = 1")
+        if not row or not row.get("last_run_at"):
+            return {"status": "cron has never run"}
+        age_min = (datetime.now(timezone.utc) - row["last_run_at"]).total_seconds() / 60
+        now_pkt = datetime.now(PKT)
+        in_market_hours = now_pkt.weekday() < 5 and dtime(9, 0) <= now_pkt.time() <= dtime(17, 0)
+        return {
+            "last_run_minutes_ago": round(age_min, 1),
+            "stale": in_market_hours and age_min > 40,
+            "last_alerts_evaluated": row.get("last_alerts_evaluated"),
+            "last_events_created": row.get("last_events_created"),
+            "last_error": row.get("last_error"),
+        }
+
+    await run("db_connectivity", db.fetchrow("SELECT 1 AS ok"), lambda v: v)
+    for table in ("watchlist", "alerts", "alert_events", "last_seen_announcement"):
+        await run(f"table:{table}", db.fetch(f"SELECT count(*) AS n FROM {table}"), lambda v: f"{v[0]['n']} rows")
+    await run("cron", _cron_status(), lambda v: v)
+
     if not checks["token"]["ok"]:
         try:
             checks["diagnostics"] = {"ok": True, "sample": await c.probe()}
@@ -713,8 +957,44 @@ async def psx_selftest() -> dict:
 # =============================================================================== ASGI app
 
 
+CRON_PATH = "/api/cron/check-alerts"
+
+
+async def _drain(receive) -> None:
+    while True:
+        msg = await receive()
+        if not msg.get("more_body", False):
+            return
+
+
+async def _json_response(send, status: int, body: dict) -> None:
+    await send({"type": "http.response.start", "status": status, "headers": [(b"content-type", b"application/json")]})
+    await send({"type": "http.response.body", "body": json.dumps(body).encode()})
+
+
+async def _handle_cron(scope, receive, send) -> None:
+    """POST /api/cron/check-alerts, header X-Cron-Secret. Meant to be called
+    every ~15 min by the GitHub Actions workflow (Vercel Hobby cron is once a
+    day, too coarse for intraday alerts)."""
+    await _drain(receive)
+    if scope["method"] != "POST":
+        return await _json_response(send, 405, {"error": "POST required"})
+    headers = dict(scope.get("headers") or [])
+    got = headers.get(b"x-cron-secret", b"").decode()
+    expected = os.environ.get("CRON_SECRET", "").strip()
+    if not expected or not hmac.compare_digest(got, expected):
+        return await _json_response(send, 401, {"error": "unauthorized"})
+    try:
+        summary = await repository.evaluate_alerts(client())
+    except Exception as e:  # noqa: BLE001
+        log.exception("alert evaluation failed")
+        return await _json_response(send, 500, {"error": str(e)[:300]})
+    await _json_response(send, 200, summary)
+
+
 class SecretPathMiddleware:
-    """Only /<secret>/mcp reaches the MCP app; /health is public; all else 404.
+    """Only /<secret>/mcp reaches the MCP app; /health is public; the cron
+    endpoint has its own header-based secret; all else 404.
 
     claude.ai custom connectors take a URL (no custom headers), so the secret
     lives in the path. Treat the full URL like a password."""
@@ -732,6 +1012,8 @@ class SecretPathMiddleware:
             await send({"type": "http.response.start", "status": 200, "headers": [(b"content-type", b"application/json")]})
             await send({"type": "http.response.body", "body": body})
             return
+        if path == CRON_PATH:
+            return await _handle_cron(scope, receive, send)
         if self.prefix:
             if not (path == self.prefix + "/mcp" or path.startswith(self.prefix + "/mcp/")):
                 await send({"type": "http.response.start", "status": 404, "headers": [(b"content-type", b"text/plain")]})

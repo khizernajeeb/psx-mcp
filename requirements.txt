@@ -3,3 +3,4 @@ httpx[http2]==0.28.1
 beautifulsoup4==4.14.3
 lxml==6.1.0
 uvicorn==0.46.0
+psycopg[binary]==3.2.10

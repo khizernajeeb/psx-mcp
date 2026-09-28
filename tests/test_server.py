@@ -61,6 +61,12 @@ def _free_port():
 def base_url(request):
     import os
     os.environ["MCP_SECRET"] = SECRET
+    # This file only exercises PSX-facing tools, deliberately with no DB
+    # configured -- unset DATABASE_URL/CRON_SECRET so its psx_selftest
+    # assertion is deterministic regardless of what other test modules
+    # (e.g. test_extensions.py) left in the environment.
+    os.environ.pop("DATABASE_URL", None)
+    os.environ.pop("CRON_SECRET", None)
     S._client = PSXClient(transport=httpx.MockTransport(portal), min_interval=0)
     port = _free_port()
     app = S.build_app() if request.param == "server" else S.build_serverless_app()
@@ -160,7 +166,11 @@ def test_misc_tools(base_url):
     e = run(_call(U(base_url), "psx_company", {"symbol": "XXXX"}))
     assert "error" in e
     st = run(_call(U(base_url), "psx_selftest"))
-    assert st["passed"] == "16/16", st
+    # 16 PSX checks pass; the 6 DB/cron checks fail gracefully since no
+    # DATABASE_URL is configured in this file (see tests/test_extensions.py
+    # for those, against a real Postgres).
+    assert st["passed"] == "16/22", st
+    assert st["checks"]["db_connectivity"]["ok"] is False
 
 
 def test_token_refresh_on_403():
