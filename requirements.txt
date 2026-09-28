@@ -1,0 +1,5 @@
+mcp==1.27.0
+httpx==0.28.1
+beautifulsoup4==4.14.3
+lxml==6.1.0
+uvicorn==0.46.0
