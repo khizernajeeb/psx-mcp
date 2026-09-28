@@ -56,6 +56,10 @@ TTL = {
     "eod": 3600,
     "payouts": 6 * 3600,
     "symbols": 24 * 3600,
+    "screener": 600,
+    "payouts_feed": 1800,
+    "calendar": 3600,
+    "reports": 6 * 3600,
 }
 
 
@@ -346,3 +350,34 @@ class PSXClient:
             return parsers.parse_announcements(await self.ajax("/announcements", "POST", form))
 
         return await self.cache.get_or_set(key, TTL["announcements"], f)
+
+    async def screener(self) -> list[dict]:
+        async def f():
+            rows = parsers.parse_screener(await self.page("/screener"))
+            if not rows:
+                raise PSXError("Screener came back empty (layout change?)")
+            return rows
+
+        return await self.cache.get_or_set("screener", TTL["screener"], f)
+
+    async def payouts_feed(self, symbol: str = "", count: int = 25, offset: int = 0) -> dict:
+        form = {"symbol": symbol.upper().strip(), "count": str(count), "offset": str(offset)}
+
+        async def f():
+            return parsers.parse_payouts_feed(await self.ajax("/payouts", "POST", form))
+
+        return await self.cache.get_or_set("pfeed:" + "|".join(form.values()), TTL["payouts_feed"], f)
+
+    async def calendar(self, date_from: str, date_to: str) -> list[dict]:
+        async def f():
+            return parsers.parse_calendar(await self.ajax("/calendar", "POST", {"from": date_from, "to": date_to}))
+
+        return await self.cache.get_or_set(f"cal:{date_from}:{date_to}", TTL["calendar"], f)
+
+    async def reports(self, symbol: str) -> list[dict]:
+        sym = symbol.upper().strip()
+
+        async def f():
+            return parsers.parse_reports(await self.ajax(f"/company/reports/{sym}"))
+
+        return await self.cache.get_or_set(f"reports:{sym}", TTL["reports"], f)

@@ -21,7 +21,8 @@ def portal(request: httpx.Request) -> httpx.Response:
     path = request.url.path
     CALLS.append(path)
     ajax_paths = ("/market-watch", "/symbols", "/timeseries/", "/announcements", "/company/payouts",
-                  "/sector-summary/sectorwise", "/indices/")
+                  "/sector-summary/sectorwise", "/indices/", "/payouts", "/calendar",
+                  "/company/reports/")
     is_ajax = any(path.startswith(p) for p in ajax_paths)
     if is_ajax:
         if request.headers.get("X-Requested-With") != "XMLHttpRequest":
@@ -40,6 +41,11 @@ def portal(request: httpx.Request) -> httpx.Response:
         "/announcements": ("announcements.html", "text/html"),
         "/timeseries/eod/MEBL": ("eod_MEBL.json", "application/json"),
         "/timeseries/int/MEBL": ("int_MEBL.json", "application/json"),
+        "/timeseries/eod/KSE100": ("eod_MEBL.json", "application/json"),
+        "/screener": ("screener.html", "text/html"),
+        "/payouts": ("payouts_feed.html", "text/html"),
+        "/calendar": ("calendar.json", "application/json"),
+        "/company/reports/LUCK": ("reports_LUCK.html", "text/html"),
     }
     if path in routes:
         name, ct = routes[path]
@@ -111,6 +117,7 @@ def test_market_summary(base_url):
     assert d["breadth"] == {"symbols_traded": 5, "advancers": 3, "decliners": 2, "unchanged": 0,
                             "total_volume": 53237236 + 82407 + 9780700 + 1883930 + 1200000}
     assert d["top_gainers"][0]["symbol"] == "TISL" and d["top_losers"][0]["symbol"] == "FPJM"
+    assert "ZZZ" not in [g["symbol"] for g in d["top_gainers"] + d["top_losers"]]
     assert d["most_active"][0]["sector"] == "MISCELLANEOUS"
 
 
@@ -153,7 +160,7 @@ def test_misc_tools(base_url):
     e = run(_call(U(base_url), "psx_company", {"symbol": "XXXX"}))
     assert "error" in e
     st = run(_call(U(base_url), "psx_selftest"))
-    assert st["passed"] == "11/11", st
+    assert st["passed"] == "16/16", st
 
 
 def test_token_refresh_on_403():
@@ -179,3 +186,40 @@ def test_client_survives_new_event_loops():
 def test_serverless_requires_secret(monkeypatch):
     monkeypatch.setenv("MCP_SECRET", "short")
     assert S.build_serverless_app() is S._misconfigured
+
+
+def test_screener_compare_portfolio(base_url):
+    d = run(_call(U(base_url), "psx_screener", {"sector": "cement", "max_pe": 10, "sort_by": "pe", "ascending": True}))
+    assert [r["symbol"] for r in d["results"]] == ["LUCK"]  # DGKC pe 12 filtered, LOSS has no pe
+    d = run(_call(U(base_url), "psx_screener", {"index": "KSE100", "min_dividend_yield": 2}))
+    assert [r["symbol"] for r in d["results"]] == ["MEBL", "LUCK"] and d["results"][0]["market_cap_bn"] == 990.18
+    d = run(_call(U(base_url), "psx_screener", {"shariah_only": True, "sector": "cement"}))
+    assert [r["symbol"] for r in d["results"]] == ["LUCK", "LOSS"]
+    c = run(_call(U(base_url), "psx_compare", {"symbols": ["MEBL", "LUCK", "NOPE"]}))
+    assert [r["symbol"] for r in c["comparison"]] == ["MEBL", "LUCK"] and c["not_found"] == ["NOPE"]
+    assert "rsi_14" in c["comparison"][0]
+    p = run(_call(U(base_url), "psx_portfolio", {"holdings": [
+        {"symbol": "MEBL", "quantity": 100, "avg_cost": 500},
+        {"symbol": "LUCK", "quantity": 10, "avg_cost": 400},
+        {"symbol": "WTL", "quantity": 1000}]}))
+    sm = p["summary"]
+    assert sm["market_value"] == round(100 * 547.94 + 10 * 450.5 + 1000 * 1.05, 2)
+    assert sm["cost_value"] == 54000 and sm["unrealized_pnl"] == round(100 * 47.94 + 10 * 50.5, 2)
+    assert p["positions"][0]["symbol"] == "MEBL" and p["positions"][0]["unrealized_pnl"] == 4794.0
+    assert round(sum(p["sector_allocation_pct"].values())) == 100
+
+
+def test_payouts_calendar_reports_index(base_url):
+    f = run(_call(U(base_url), "psx_recent_payouts", {"only_cash": True}))
+    assert f["total"] == 682 and [i["symbol"] for i in f["items"]] == ["STJT", "SAPT"]
+    assert f["items"][0]["cash_per_share_pkr_if_face_10"] == 11.5 and f["items"][0]["sequence"] == "final"
+    cal = run(_call(U(base_url), "psx_corporate_calendar", {"date_from": "2026-10-01", "date_to": "2026-10-31"}))
+    assert [e["symbol"] for e in cal["events"]] == ["LUCK", "SLCL", "GWLC"]
+    cal = run(_call(U(base_url), "psx_corporate_calendar", {"date_from": "2026-10-01", "meeting_type": "AGM"}))
+    assert cal["count"] == 2
+    r = run(_call(U(base_url), "psx_financial_reports", {"symbol": "LUCK", "report_type": "annual"}))
+    assert r["count"] == 1 and r["reports"][0]["pdf"].startswith("https://financials.psx.com.pk/")
+    r = run(_call(U(base_url), "psx_financial_reports", {"symbol": "LUCK"}))
+    assert r["reports"][0]["period_ended"] == "2026-03-31"
+    h = run(_call(U(base_url), "psx_price_history", {"symbol": "KSE100", "include_bars": False}))
+    assert h["summary"]["last_close"] == 548.12

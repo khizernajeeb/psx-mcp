@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 import os
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Annotated, Any, Literal
 
 from mcp.server.fastmcp import FastMCP
@@ -32,7 +32,12 @@ Tips: use psx_market_summary for "how is the market", psx_top_movers for
 gainers/losers/most active (shariah_only=True restricts to KMI All-Share members),
 psx_quote for several symbols at once, psx_company for fundamentals/financials,
 psx_price_history for returns/RSI/moving averages, psx_dividends for payouts,
-psx_announcements for results and corporate notices. Symbols are PSX tickers
+psx_announcements for results and corporate notices, psx_screener to filter
+all stocks by P/E, dividend yield, market cap, 1Y return, sector or index,
+psx_compare for side-by-side, psx_portfolio to value holdings,
+psx_recent_payouts for market-wide dividend news, psx_corporate_calendar for
+AGMs/EOGMs, psx_financial_reports for report PDFs. psx_price_history also
+accepts index codes (KSE100, KMI30). Symbols are PSX tickers
 like MEBL, LUCK, OGDC; use psx_search when you only know the company name.
 Data is scraped from the public portal and may lag slightly; it is not
 investment advice."""
@@ -97,7 +102,8 @@ def _slim(r: dict) -> dict:
 async def psx_market_summary() -> dict:
     """Snapshot of the whole PSX market right now: all index levels (KSE100, KSE30,
     KMI30, KMIALLSHR, ALLSHR, ...), market breadth (advancers/decliners/unchanged),
-    total volume, and the top 5 gainers, losers and most active stocks."""
+    total volume, and the top 5 gainers and losers (volume >= 10,000) and most
+    active stocks."""
     try:
         idx = await client().indices()
         rows = await _mw_with_sectors()
@@ -106,7 +112,8 @@ async def psx_market_summary() -> dict:
     traded = [r for r in rows if (r["volume"] or 0) > 0]
     adv = sum(1 for r in traded if (r["change"] or 0) > 0)
     dec = sum(1 for r in traded if (r["change"] or 0) < 0)
-    by = lambda k, rev: [_slim(r) for r in sorted(traded, key=lambda r: r[k] or 0, reverse=rev)[:5]]  # noqa: E731
+    liquid = [r for r in traded if (r["volume"] or 0) >= 10_000]  # skip 100-share freak moves
+    by = lambda k, rev, pool: [_slim(r) for r in sorted(pool, key=lambda r: r[k] or 0, reverse=rev)[:5]]  # noqa: E731
     return {
         "fetched_at": _now(),
         "indices": idx,
@@ -117,9 +124,10 @@ async def psx_market_summary() -> dict:
             "unchanged": len(traded) - adv - dec,
             "total_volume": int(sum(r["volume"] or 0 for r in traded)),
         },
-        "top_gainers": by("change_pct", True),
-        "top_losers": by("change_pct", False),
-        "most_active": by("volume", True),
+        "top_gainers": by("change_pct", True, liquid),
+        "top_losers": by("change_pct", False, liquid),
+        "most_active": by("volume", True, traded),
+        "note": "Gainers/losers only include stocks with volume >= 10,000; use psx_top_movers for other filters.",
     }
 
 
@@ -242,14 +250,15 @@ _PERIOD_DAYS = {"1m": 31, "3m": 92, "6m": 183, "1y": 366, "3y": 1096, "5y": 1827
 
 @mcp.tool(annotations=RO)
 async def psx_price_history(
-    symbol: Annotated[str, Field(description="PSX ticker")],
+    symbol: Annotated[str, Field(description="PSX ticker, or an index code such as KSE100, KMI30, ALLSHR")],
     period: Annotated[Literal["1m", "3m", "6m", "1y", "3y", "5y", "max"], Field(description="Window of bars to return")] = "3m",
     interval: Annotated[Literal["daily", "weekly", "intraday"], Field(description="intraday = today's ticks")] = "daily",
     include_bars: Annotated[bool, Field(description="False returns only the indicator summary (smaller)")] = True,
 ) -> dict:
     """Historical prices plus a technical summary: 1w/1m/3m/6m/YTD/1y/3y returns,
     SMA 20/50/200, RSI(14), MACD, 52-week high/low, 60-day annualized volatility
-    and 20-day average volume. Daily bars have date, open, close, volume."""
+    and 20-day average volume. Daily bars have date, open, close, volume.
+    Works for indices too (symbol='KSE100') for market history questions."""
     try:
         if interval == "intraday":
             ticks = await client().intraday(symbol)
@@ -390,6 +399,274 @@ async def psx_search(
     return {"query": query, "count": len(hits), "results": hits[:limit]}
 
 
+_SCREEN_SORT = {
+    "market_cap": "market_cap_pkr",
+    "pe": "pe_ttm",
+    "dividend_yield": "dividend_yield_pct",
+    "change_1y": "change_1y_pct",
+    "change_today": "change_pct",
+    "avg_volume": "avg_volume_30d",
+    "price": "price",
+}
+
+
+async def _screener_with_sectors() -> list[dict]:
+    rows = await client().screener()
+    names = await client().sector_names()
+    return [{**r, "sector": names.get(r["sector_code"], r["sector_code"])} for r in rows]
+
+
+@mcp.tool(annotations=RO)
+async def psx_screener(
+    sector: Annotated[str | None, Field(description="Sector name, partial match: 'cement', 'bank', 'fertilizer', 'oil & gas exploration', 'technology'")] = None,
+    index: Annotated[str | None, Field(description="Only members of this index, e.g. KSE100, KSE30, KMI30, KMIALLSHR")] = None,
+    shariah_only: bool = False,
+    min_pe: float | None = None,
+    max_pe: float | None = None,
+    min_dividend_yield: Annotated[float | None, Field(description="Percent, e.g. 8 for 8%")] = None,
+    min_market_cap_bn: Annotated[float | None, Field(description="PKR billions")] = None,
+    max_market_cap_bn: Annotated[float | None, Field(description="PKR billions")] = None,
+    min_change_1y: Annotated[float | None, Field(description="Minimum 1-year return %")] = None,
+    max_change_1y: Annotated[float | None, Field(description="Maximum 1-year return %")] = None,
+    min_avg_volume: Annotated[float | None, Field(description="Minimum 30-day average daily volume (liquidity)")] = None,
+    min_price: float | None = None,
+    max_price: float | None = None,
+    sort_by: Literal["market_cap", "pe", "dividend_yield", "change_1y", "change_today", "avg_volume", "price"] = "market_cap",
+    ascending: bool = False,
+    limit: Annotated[int, Field(ge=1, le=200)] = 25,
+) -> dict:
+    """Stock screener over every listed PSX equity using valuation data: market cap,
+    P/E (TTM), dividend yield, 1-year return, free float and 30-day average volume.
+    Example: cheap Shariah cement stocks = sector='cement', shariah_only=True,
+    max_pe=8, sort_by='pe', ascending=True. Stocks with no P/E (losses or no
+    earnings data) are excluded whenever a P/E filter or P/E sort is used."""
+    try:
+        rows = await _screener_with_sectors()
+    except PSXError as e:
+        return _err(e)
+
+    def ok(r: dict) -> bool:
+        if shariah_only and not r["shariah"]:
+            return False
+        if sector and sector.lower().rstrip("s") not in (r.get("sector") or "").lower():
+            return False
+        if index and index.upper() not in r["listed_in"]:
+            return False
+        pe = r["pe_ttm"]
+        if (min_pe is not None or max_pe is not None or sort_by == "pe") and (pe is None or pe <= 0):
+            return False
+        checks = [
+            (min_pe, pe, 1), (max_pe, pe, -1),
+            (min_dividend_yield, r["dividend_yield_pct"], 1),
+            (min_market_cap_bn, (r["market_cap_pkr"] or 0) / 1e9, 1),
+            (max_market_cap_bn, (r["market_cap_pkr"] or 0) / 1e9, -1),
+            (min_change_1y, r["change_1y_pct"], 1), (max_change_1y, r["change_1y_pct"], -1),
+            (min_avg_volume, r["avg_volume_30d"], 1),
+            (min_price, r["price"], 1), (max_price, r["price"], -1),
+        ]
+        for bound, val, direction in checks:
+            if bound is None:
+                continue
+            if val is None or (direction == 1 and val < bound) or (direction == -1 and val > bound):
+                return False
+        return True
+
+    hits = [r for r in rows if ok(r)]
+    key = _SCREEN_SORT[sort_by]
+    hits.sort(key=lambda r: (r[key] is None, (r[key] or 0) if ascending else -(r[key] or 0)))
+    out = []
+    for r in hits[:limit]:
+        out.append({
+            "symbol": r["symbol"], "sector": r["sector"], "price": r["price"], "change_pct": r["change_pct"],
+            "market_cap_bn": round((r["market_cap_pkr"] or 0) / 1e9, 2), "pe_ttm": r["pe_ttm"],
+            "dividend_yield_pct": r["dividend_yield_pct"], "change_1y_pct": r["change_1y_pct"],
+            "avg_volume_30d": r["avg_volume_30d"], "free_float_shares": r["free_float_shares"], "shariah": r["shariah"],
+        })
+    return {"fetched_at": _now(), "matches": len(hits), "returned": len(out), "results": out}
+
+
+@mcp.tool(annotations=RO)
+async def psx_compare(
+    symbols: Annotated[list[str], Field(description="2-10 tickers to compare side by side", min_length=2, max_length=10)],
+    include_technicals: Annotated[bool, Field(description="Add RSI, SMA200 position and 1m/3m returns (slower)")] = True,
+) -> dict:
+    """Side-by-side comparison: price, today's change, market cap, P/E, dividend
+    yield, 1-year return, liquidity, Shariah status and (optionally) RSI, trend vs
+    200-day average and 1m/3m returns."""
+    try:
+        scr = {r["symbol"]: r for r in await _screener_with_sectors()}
+    except PSXError as e:
+        return _err(e)
+    rows, missing = [], []
+    for s in symbols:
+        s = s.upper().strip()
+        r = scr.get(s)
+        if r is None:
+            missing.append(s)
+            continue
+        row = {
+            "symbol": s, "sector": r["sector"], "price": r["price"], "change_pct": r["change_pct"],
+            "market_cap_bn": round((r["market_cap_pkr"] or 0) / 1e9, 2), "pe_ttm": r["pe_ttm"],
+            "dividend_yield_pct": r["dividend_yield_pct"], "change_1y_pct": r["change_1y_pct"],
+            "avg_volume_30d": r["avg_volume_30d"], "shariah": r["shariah"],
+        }
+        if include_technicals:
+            try:
+                sm = analytics.summarize(await client().eod(s))
+                row.update(rsi_14=sm.get("rsi_14"), price_vs_sma200=sm.get("price_vs_sma200"),
+                           return_1m_pct=sm["returns_pct"].get("1m"), return_3m_pct=sm["returns_pct"].get("3m"),
+                           pct_from_52w_high=sm.get("pct_from_52w_high"))
+            except PSXError:
+                pass
+        rows.append(row)
+    out: dict[str, Any] = {"fetched_at": _now(), "comparison": rows}
+    if missing:
+        out["not_found"] = missing
+    return out
+
+
+@mcp.tool(annotations=RO)
+async def psx_portfolio(
+    holdings: Annotated[
+        list[dict],
+        Field(description="List of {symbol, quantity, avg_cost}. avg_cost is your average buy price per share (PKR); optional."),
+    ],
+) -> dict:
+    """Value a portfolio at live PSX prices: market value, cost, unrealized P&L
+    (PKR and %), today's P&L, weight of each holding, sector allocation and
+    Shariah share. Nothing is stored; holdings are only used for this answer."""
+    try:
+        live = {r["symbol"]: r for r in await _mw_with_sectors()}
+    except PSXError as e:
+        return _err(e)
+    positions, missing = [], []
+    tot_val = tot_cost = tot_day = val_with_cost = 0.0
+    for h in holdings:
+        sym = str(h.get("symbol", "")).upper().strip()
+        qty = float(h.get("quantity") or h.get("qty") or 0)
+        cost = h.get("avg_cost") if h.get("avg_cost") is not None else h.get("cost")
+        r = live.get(sym)
+        price = r["current"] if r else None
+        ldcp = r["ldcp"] if r else None
+        sector = r.get("sector") if r else None
+        shariah = r["shariah"] if r else None
+        if r is None:
+            try:
+                c = await client().company(sym)
+                price, ldcp, sector = c["price"], c["stats"].get("ldcp"), c["sector"]
+            except PSXError:
+                missing.append(sym)
+                continue
+        value = qty * (price or 0)
+        day = qty * ((price or 0) - (ldcp or price or 0))
+        pos = {"symbol": sym, "quantity": qty, "price": price, "market_value": round(value, 2),
+               "day_pnl": round(day, 2), "day_change_pct": r["change_pct"] if r else None,
+               "sector": sector, "shariah": shariah}
+        if cost is not None:
+            c_total = qty * float(cost)
+            pos.update(avg_cost=float(cost), cost_value=round(c_total, 2),
+                       unrealized_pnl=round(value - c_total, 2),
+                       unrealized_pnl_pct=round((value - c_total) / c_total * 100, 2) if c_total else None)
+            tot_cost += c_total
+            val_with_cost += value
+        tot_val += value
+        tot_day += day
+        positions.append(pos)
+    sectors: dict[str, float] = {}
+    for p in positions:
+        p["weight_pct"] = round(p["market_value"] / tot_val * 100, 2) if tot_val else None
+        sectors[p["sector"] or "UNKNOWN"] = sectors.get(p["sector"] or "UNKNOWN", 0) + p["market_value"]
+    positions.sort(key=lambda p: p["market_value"], reverse=True)
+    shariah_val = sum(p["market_value"] for p in positions if p["shariah"])
+    summary = {
+        "market_value": round(tot_val, 2),
+        "day_pnl": round(tot_day, 2),
+        "day_pnl_pct": round(tot_day / (tot_val - tot_day) * 100, 2) if tot_val - tot_day else None,
+        "shariah_pct_of_value": round(shariah_val / tot_val * 100, 2) if tot_val else None,
+    }
+    if tot_cost:
+        # P&L only over positions whose cost was given.
+        summary.update(cost_value=round(tot_cost, 2), unrealized_pnl=round(val_with_cost - tot_cost, 2),
+                       unrealized_pnl_pct=round((val_with_cost - tot_cost) / tot_cost * 100, 2))
+    out: dict[str, Any] = {
+        "fetched_at": _now(),
+        "summary": summary,
+        "sector_allocation_pct": {k: round(v / tot_val * 100, 2) for k, v in sorted(sectors.items(), key=lambda x: -x[1])} if tot_val else {},
+        "positions": positions,
+        "note": "Excludes brokerage, CVT and taxes; P&L is on price only.",
+    }
+    if missing:
+        out["not_found"] = missing
+    return out
+
+
+@mcp.tool(annotations=RO)
+async def psx_recent_payouts(
+    symbol: Annotated[str | None, Field(description="Filter by ticker; omit for the whole market")] = None,
+    only_cash: Annotated[bool, Field(description="Only cash dividends")] = False,
+    limit: Annotated[int, Field(ge=1, le=100)] = 25,
+    offset: Annotated[int, Field(ge=0)] = 0,
+) -> dict:
+    """Latest dividend, bonus and right-share announcements across all PSX
+    companies (newest first) with book-closure dates. Use for "which companies
+    announced dividends this week" or "upcoming book closures"."""
+    try:
+        res = await client().payouts_feed(symbol or "", limit, offset)
+    except PSXError as e:
+        return _err(e)
+    items = res["items"]
+    if only_cash:
+        items = [i for i in items if i["type"] == "cash dividend"]
+    return {"fetched_at": _now(), "total": res["total"], "items": items,
+            "note": "Payout % is on face value (usually PKR 10): 100% = PKR 10/share."}
+
+
+@mcp.tool(annotations=RO)
+async def psx_corporate_calendar(
+    date_from: Annotated[str | None, Field(description="YYYY-MM-DD; default today")] = None,
+    date_to: Annotated[str | None, Field(description="YYYY-MM-DD; default 30 days after date_from")] = None,
+    symbol: Annotated[str | None, Field(description="Filter by ticker")] = None,
+    meeting_type: Annotated[Literal["AGM", "EOGM", "ARM"] | None, Field(description="AGM annual general, EOGM extraordinary general, ARM annual review")] = None,
+) -> dict:
+    """Upcoming (or past) shareholder meetings from the PSX corporate calendar:
+    AGMs, EOGMs and annual review meetings with date, time, city and period."""
+    from datetime import date as _date, timedelta
+
+    try:
+        start = _date.fromisoformat(date_from) if date_from else datetime.now(PKT).date()
+        end = _date.fromisoformat(date_to) if date_to else start + timedelta(days=30)
+    except ValueError:
+        return {"error": "Dates must be YYYY-MM-DD"}
+    if (end - start).days > 120:
+        end = start + timedelta(days=120)
+    try:
+        events = await client().calendar(start.isoformat(), end.isoformat())
+    except PSXError as e:
+        return _err(e)
+    if symbol:
+        events = [e for e in events if (e["symbol"] or "").upper() == symbol.upper().strip()]
+    if meeting_type:
+        events = [e for e in events if e["type"] == meeting_type]
+    return {"fetched_at": _now(), "from": start.isoformat(), "to": end.isoformat(), "count": len(events), "events": events}
+
+
+@mcp.tool(annotations=RO)
+async def psx_financial_reports(
+    symbol: Annotated[str, Field(description="PSX ticker")],
+    report_type: Annotated[Literal["all", "annual", "quarterly"], Field()] = "all",
+    limit: Annotated[int, Field(ge=1, le=100)] = 10,
+) -> dict:
+    """Links to a company's filed annual and quarterly financial report PDFs,
+    newest period first. Open the PDF link to read the full statements."""
+    try:
+        rows = await client().reports(symbol)
+    except PSXError as e:
+        return _err(e)
+    if report_type != "all":
+        rows = [r for r in rows if r["type"].lower().startswith(report_type[:6])]
+    return {"symbol": symbol.upper(), "fetched_at": _now(), "count": len(rows), "reports": rows[:limit]}
+
+
 @mcp.tool(annotations=RO)
 async def psx_selftest() -> dict:
     """Health check: calls every PSX endpoint this server depends on and reports
@@ -416,6 +693,12 @@ async def psx_selftest() -> dict:
     await run("payouts", c.payouts("MEBL"), lambda v: f"{len(v)} payouts")
     await run("announcements", c.announcements("MEBL", count=3), lambda v: f"{len(v['items'])} items of {v['total']}")
     await run("constituents", c.constituents("KSE100"), lambda v: f"{len(v)} members")
+    await run("screener", c.screener(), lambda v: f"{len(v)} stocks, MEBL pe {next((r['pe_ttm'] for r in v if r['symbol']=='MEBL'), None)}")
+    await run("payouts_feed", c.payouts_feed(count=3), lambda v: f"{len(v['items'])} items of {v['total']}")
+    _today = datetime.now(PKT).date()
+    await run("calendar", c.calendar(_today.isoformat(), (_today + timedelta(days=30)).isoformat()), lambda v: f"{len(v)} events")
+    await run("reports", c.reports("LUCK"), lambda v: f"{len(v)} reports, newest {v[0]['period_ended'] if v else None}")
+    await run("index_history", c.eod("KSE100"), lambda v: f"{len(v)} bars, last {v[-1]['close'] if v else None}")
     if not checks["token"]["ok"]:
         try:
             checks["diagnostics"] = {"ok": True, "sample": await c.probe()}

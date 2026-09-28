@@ -21,6 +21,12 @@ Data comes from the public PSX Data Portal (dps.psx.com.pk). This is for
 | `psx_index_constituents` | KSE100, KMI30 and other index members with weights and points contributed |
 | `psx_sectors` | Sector breadth, turnover and market cap |
 | `psx_search` | Find a ticker from a company name |
+| `psx_screener` | Filter every listed stock by P/E, dividend yield, market cap, 1Y return, liquidity, sector, index, Shariah |
+| `psx_compare` | Side‑by‑side valuation and technicals for 2–10 stocks |
+| `psx_portfolio` | Value your holdings at live prices: P&L, day change, weights, sector and Shariah allocation |
+| `psx_recent_payouts` | Market‑wide latest dividend/bonus/right announcements and book closures |
+| `psx_corporate_calendar` | Upcoming AGMs, EOGMs and annual review meetings |
+| `psx_financial_reports` | Annual and quarterly report PDF links |
 | `psx_selftest` | Checks every PSX endpoint; run it first after deploying |
 
 ## How it talks to PSX
@@ -41,7 +47,7 @@ retries 503s, and caches results (30 s for prices, 1 h for daily history,
 4. Check `https://<project>.vercel.app/health`.
 5. Connector URL: `https://<project>.vercel.app/<MCP_SECRET>/mcp`
 
-`vercel.json` pins the function to Mumbai (`bom1`), the region closest to PSX.
+`vercel.json` pins the function to Singapore (`sin1`). PSX's firewall (DOSarrest) returns "462 Forbidden Region" to Indian IPs, so avoid `bom1`.
 `app.py` is the Vercel entrypoint; it serves MCP statelessly, one request at a time.
 
 ## Deploy on Render (free)
@@ -61,7 +67,7 @@ retries 503s, and caches results (30 s for prices, 1 h for daily history,
 
 Go to claude.ai → **Settings → Connectors → Add custom connector**. Name it
 `PSX`, paste the connector URL, and leave OAuth empty. In a chat, enable the
-connector and ask Claude to run `psx_selftest`. All 11 checks should pass.
+connector and ask Claude to run `psx_selftest`. All 16 checks should pass.
 
 Treat the connector URL like a password, since anyone with it can use your server.
 

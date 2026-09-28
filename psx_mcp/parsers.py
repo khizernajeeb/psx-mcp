@@ -68,11 +68,12 @@ def _txt(el: Tag | None) -> str:
 
 def _cell_value(td: Tag) -> float | None:
     """Prefer the machine-readable data-order attribute, fall back to text."""
+    v = None
     if td.has_attr("data-order"):
         v = num(td["data-order"])
-        if v is not None:
-            return v
-    return num(_txt(td))
+    if v is None:
+        v = num(_txt(td))
+    return round(v, 4) if v is not None else None
 
 
 def _soup(html: str) -> BeautifulSoup:
@@ -347,31 +348,24 @@ def parse_company(html: str, symbol: str) -> dict:
     }
     result["stats"] = {rename.get(k, k): v for k, v in stats.items()}
 
-    # Profile: description, people, address, website, registrar, auditor, FY end.
+    # Profile: <div class="item__head">LABEL</div> followed by <p> or <table>.
     profile: dict[str, Any] = {}
     prof = soup.select_one("#profile")
     if prof is not None:
-        for label, val_el in _label_value_pairs(prof):
-            key = _snake(label)
-            if not key:
+        for head in prof.select(".item__head, .stats_label"):
+            key = _snake(_txt(head))
+            val = head.find_next_sibling()
+            if not key or val is None:
                 continue
-            if val_el.find("table") is not None or key == "key_people":
-                people = []
-                for tr in val_el.find_all("tr"):
-                    tds = tr.find_all("td")
-                    if len(tds) >= 2:
-                        people.append({"name": _txt(tds[0]), "role": _txt(tds[1])})
-                profile[key] = people
-            else:
-                profile[key] = _txt(val_el)
-        if "key_people" not in profile:
-            t = prof.find("table")
-            if t is not None:
-                profile["key_people"] = [
+            if val.name == "table" or val.find("table") is not None:
+                t = val if val.name == "table" else val.find("table")
+                profile[key] = [
                     {"name": _txt(tds[0]), "role": _txt(tds[1])}
                     for tds in (tr.find_all("td") for tr in t.find_all("tr"))
                     if len(tds) >= 2
                 ]
+            else:
+                profile[key] = _txt(val)
     result["profile"] = profile
 
     # Equity: market cap (PKR '000), shares, free float (shares and %).
@@ -538,4 +532,129 @@ def parse_timeseries(text: str, kind: str) -> list[dict]:
             item = {"time": dt.strftime("%Y-%m-%d %H:%M"), "price": float(r[1]), "volume": vol}
         out.append(item)
     out.sort(key=lambda x: x.get("date") or x.get("time"))
+    return out
+
+
+# --------------------------------------------------------------------------- screener
+
+
+def parse_screener(html: str) -> list[dict]:
+    """/screener -> every listed equity with valuation fields.
+    Columns: SYMBOL | SECTOR | LISTED IN | MARKET CAP | PRICE | CHANGE % |
+    1-YEAR CH % | PE (TTM) | DIVIDEND YIELD % | FREE FLOAT | 30D VOLUME AVG."""
+    soup = _soup(html)
+    table = soup.find("table")
+    if table is None:
+        return []
+    out = []
+    for tr in _table_rows(table):
+        tds = tr.find_all("td", recursive=False)
+        if len(tds) < 11:
+            continue
+        listed_in = [x for x in _txt(tds[2]).replace(" ", "").split(",") if x]
+        pe = _cell_value(tds[7])
+        out.append(
+            {
+                "symbol": _txt(tds[0]).upper(),
+                "sector_code": _txt(tds[1]),
+                "listed_in": listed_in,
+                "shariah": any(x.startswith("KMI") for x in listed_in),
+                "market_cap_pkr": _cell_value(tds[3]),
+                "price": _cell_value(tds[4]),
+                "change_pct": _cell_value(tds[5]),
+                "change_1y_pct": _cell_value(tds[6]),
+                "pe_ttm": pe if pe not in (None, 0) else None,
+                "dividend_yield_pct": _cell_value(tds[8]),
+                "free_float_shares": _cell_value(tds[9]),
+                "avg_volume_30d": _cell_value(tds[10]),
+            }
+        )
+    return out
+
+
+# --------------------------------------------------------------------------- market-wide payouts
+
+
+def parse_payouts_feed(html: str) -> dict:
+    """POST /payouts -> latest dividend/bonus/right announcements market-wide."""
+    soup = _soup(html)
+    table = soup.find("table")
+    items = []
+    if table is not None:
+        for tr in _table_rows(table):
+            tds = tr.find_all("td", recursive=False)
+            if len(tds) < 6:
+                continue
+            details = _txt(tds[3])
+            bc = _txt(tds[5])
+            items.append(
+                {
+                    "symbol": _txt(tds[0]),
+                    "company": _txt(tds[1]),
+                    "sector": _txt(tds[2]),
+                    "details": details,
+                    "announced": _txt(tds[4]),
+                    "book_closure": None if bc in ("", "-") else bc,
+                    **{k: v for k, v in _decode_payout(details, "").items() if k != "period_type"},
+                }
+            )
+    total = None
+    m = re.search(r"of\s+([\d,]+)\s+entries", soup.get_text(" "))
+    if m:
+        total = int(m.group(1).replace(",", ""))
+    return {"total": total, "items": items}
+
+
+# --------------------------------------------------------------------------- calendar
+
+
+_MEETING = {"AGM": "Annual General Meeting", "EOGM": "Extraordinary General Meeting", "ARM": "Annual Review Meeting"}
+
+
+def parse_calendar(text: str) -> list[dict]:
+    """POST /calendar {from,to} -> AGM / EOGM / ARM events."""
+    payload = json.loads(text)
+    rows = payload.get("data", []) if isinstance(payload, dict) else payload
+    out = []
+    for r in rows:
+        out.append(
+            {
+                "date": r.get("date"),
+                "time": r.get("time"),
+                "symbol": r.get("symbol"),
+                "company": r.get("name"),
+                "type": r.get("type"),
+                "type_name": _MEETING.get(r.get("type"), r.get("type")),
+                "city": r.get("city"),
+                "period_end": r.get("period_end"),
+            }
+        )
+    out.sort(key=lambda x: (x["date"] or "", x["time"] or ""))
+    return out
+
+
+# --------------------------------------------------------------------------- financial reports
+
+
+def parse_reports(html: str) -> list[dict]:
+    """/company/reports/<SYM> -> annual & quarterly report PDFs."""
+    soup = _soup(html)
+    table = soup.find("table")
+    if table is None:
+        return []
+    out = []
+    for tr in _table_rows(table):
+        tds = tr.find_all("td", recursive=False)
+        if len(tds) < 3:
+            continue
+        a = tds[0].find("a")
+        out.append(
+            {
+                "type": _txt(tds[0]),
+                "period_ended": _txt(tds[1]),
+                "posted": _txt(tds[2]),
+                "pdf": _abs(a.get("href")) if a else None,
+            }
+        )
+    out.sort(key=lambda r: (r["period_ended"], r["posted"]), reverse=True)
     return out

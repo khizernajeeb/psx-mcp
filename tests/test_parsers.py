@@ -58,6 +58,8 @@ def test_company():
     pr = c["profile"]
     assert pr["key_people"][0] == {"name": "Dr. Syed Amir Ali", "role": "CEO"}
     assert "A.F. Ferguson" in pr["auditor"] and pr["fiscal_year_end"] == "December"
+    assert pr["website"] == "www.meezanbank.com" and pr["business_description"].startswith("Meezan Bank")
+    assert pr["registrar"].startswith("THK") and pr["address"].endswith("Karachi-Pakistan")
     eq = c["equity"]
     assert eq["free_float_pct"] == 24.91 and eq["shares"] == 1807096448 and eq["market_cap_pkr_000s"] == 990180427.72
     fin = c["financials"]
