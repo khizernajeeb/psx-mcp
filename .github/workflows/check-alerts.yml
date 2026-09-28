@@ -16,7 +16,12 @@ jobs:
     steps:
       - name: Call check-alerts endpoint
         run: |
-          curl -sS -X POST "${{ secrets.APP_URL }}/api/cron/check-alerts" \
+          # Strip any trailing slash from APP_URL so a misconfigured secret
+          # (with or without one) can't produce a double slash that Vercel
+          # 308-redirects -- and follow redirects (-L) as a second safety net.
+          base="${{ secrets.APP_URL }}"
+          base="${base%/}"
+          curl -sSL -X POST "${base}/api/cron/check-alerts" \
             -H "X-Cron-Secret: ${{ secrets.CRON_SECRET }}" \
             -w "\nHTTP %{http_code}\n" \
             --fail-with-body
